@@ -221,3 +221,15 @@ __marimo__/
 
 .idea/
 output/
+
+# Временные файлы проверок (TEMP был направлен сюда из-за заполненного диска C:)
+review/_checks/mpl/
+review/_checks/Diagnostics/
+review/_checks/VBE/
+review/_checks/.ses
+review/_checks/*.cache
+review/_checks/*.npz
+review/_checks/*_preview.pdf
+
+# Временные файлы Word при открытом документе
+~$*.docx

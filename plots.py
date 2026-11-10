@@ -6,9 +6,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import NDArray
 
-from transfer_common import TransferResult
+from transfer_common import TransferResult, integrate_over_frequency
 
 RELATIVE_ERROR_FLOOR = 1e-8
+
+
+def _select(result: TransferResult, indices: NDArray) -> TransferResult:
+    """Подмножество точек наблюдения."""
+    return TransferResult(
+        result.nu_star, result.tau_radial, result.radii_m[indices],
+        result.flux_plus[indices], result.flux_minus[indices], result.div_flux[indices],
+    )
 
 
 def _save_spectra(
@@ -88,10 +96,62 @@ def _relative_error_percent(reference: NDArray, approx: NDArray) -> NDArray:
     )
 
 
+def _save_integrated(path: Path, fractions: NDArray, q_exact: NDArray, q_approx: NDArray) -> None:
+    """Q(r) = ∫div F_ν dν для обоих методов и их отношение по r/R."""
+    figure, (top, bottom) = plt.subplots(2, 1, figsize=(9, 7), sharex=True, layout="constrained")
+    top.plot(fractions, q_exact, "o-", color="C0", label="Точный метод")
+    top.plot(fractions, q_approx, "s--", color="C1", label="Шустер — Шварцшильд")
+    top.axhline(0, color="0.35", linewidth=0.8)
+    scale = np.abs(q_exact).max()
+    top.set_yscale("symlog", linthresh=max(scale * 1e-3, 1e-300))
+    top.set(ylabel=r"$Q=\int \mathrm{div}\,F_\nu\,d\nu$, Вт/м³",
+            title="Интегральная по спектру дивергенция потока")
+    top.grid(alpha=0.25)
+    top.legend()
+
+    # Отношение не показательно там, где Q_точн проходит через ноль.
+    valid = np.abs(q_exact) > 0.02 * scale
+    ratio = np.divide(q_approx, q_exact, out=np.full_like(q_exact, np.nan), where=valid)
+    bottom.plot(fractions, ratio, "o-", color="C2")
+    bottom.axhline(1, color="0.35", linewidth=0.8)
+    bottom.set(xlabel="$r/R$", ylabel=r"$Q_{\rm ШШ}/Q_{\rm точн}$",
+               title=r"Отношение (пропуски при $|Q_{\rm точн}|\leq 2\%\,\max|Q_{\rm точн}|$)")
+    bottom.grid(alpha=0.25)
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
+def _save_ratio_vs_tau(
+    path: Path, tau: NDArray, fractions: NDArray, q_exact: NDArray, q_approx: NDArray,
+) -> None:
+    """q_ШШ/q_точн в центре каждой полосы как функция её радиальной оптической толщины."""
+    figure, ax = plt.subplots(figsize=(9, 5), layout="constrained")
+    center = q_exact.shape[-1] // 2
+    for index, fraction in enumerate(fractions):
+        ref, app = q_exact[index, :, center], q_approx[index, :, center]
+        valid = np.abs(ref) > 1e-6 * np.abs(ref).max()
+        ax.scatter(tau[valid], app[valid] / ref[valid], s=12, label=rf"$r/R={fraction:g}$")
+    for level, text in ((1.0, "совпадение"), (0.75, "3/4: диффузионный предел вне оси"),
+                        (0.375, "3/8: диффузионный предел на оси")):
+        ax.axhline(level, color="0.35", linestyle="--", linewidth=0.8)
+        ax.text(tau.min(), level, " " + text, va="bottom", fontsize=8, color="0.3")
+    ax.set_xscale("log")
+    ax.set_yscale("symlog", linthresh=1)
+    ax.set(xlabel=r"$\tau_\nu$ полосы (ось → стенка)", ylabel=r"$q_{\rm ШШ}/q_{\rm точн}$",
+           title="Точность ШШ в зависимости от оптической толщины полосы")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, ncol=2)
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
 def save_comparison_plots(
     exact: TransferResult, approx: TransferResult, output_dir: Path,
     radius_m: float, frequency_scale_hz: float,
+    spectrum_fractions: tuple[float, ...] | None = None,
 ) -> None:
+    """Сохраняет все графики. Спектры по частоте строятся только для spectrum_fractions
+    (по умолчанию для всех радиусов), радиальные зависимости — по всем радиусам."""
     if not (np.array_equal(exact.nu_star, approx.nu_star)
             and np.array_equal(exact.radii_m, approx.radii_m)
             and np.array_equal(exact.tau_radial, approx.tau_radial)):
@@ -102,9 +162,32 @@ def save_comparison_plots(
         scale_label = rf"10^{{{int(exponent)}}}"
         if mantissa != "1":
             scale_label = rf"{mantissa}\times {scale_label}"
-    x_label = rf"$\nu^* = \nu / ({scale_label}\,\mathrm{{Hz}})$"
+    x_label = rf"$\nu^* = \nu / ({scale_label}\,\mathrm{{Гц}})$"
     nu_star = exact.nu_star
-    fractions = exact.radii_m / radius_m
+    all_fractions = exact.radii_m / radius_m
+
+    comparison_dir = output_dir / "comparison"
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+    _save_integrated(
+        comparison_dir / "integrated_div_flux_vs_radius.png", all_fractions,
+        integrate_over_frequency(exact.div_flux, nu_star, frequency_scale_hz),
+        integrate_over_frequency(approx.div_flux, nu_star, frequency_scale_hz),
+    )
+    if spectrum_fractions is None:
+        selected = np.arange(len(all_fractions))
+    else:
+        selected = np.array([
+            i for i, x in enumerate(all_fractions)
+            if np.any(np.isclose(x, spectrum_fractions))
+        ], dtype=int)
+    _save_ratio_vs_tau(
+        comparison_dir / "ratio_vs_tau.png", exact.tau_radial, all_fractions[selected],
+        exact.div_flux[selected], approx.div_flux[selected],
+    )
+
+    exact = _select(exact, selected)
+    approx = _select(approx, selected)
+    fractions = all_fractions[selected]
     radius_labels = [rf"$r/R = {fraction:g}$" for fraction in fractions]
     filenames = [
         f"div_flux_{i + 1:02d}_r_over_R_{fraction:g}.png"

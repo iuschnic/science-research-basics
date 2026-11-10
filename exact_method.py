@@ -1,11 +1,14 @@
 """Перенос по прямым лучам в бесконечном цилиндре без рассеяния и подсветки."""
 
+import os
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 from numpy.typing import NDArray
 
 from opacity_table import OpacityTable
-from transfer_common import TransferResult, planck as _planck, prepare_case
+from transfer_common import TemperatureProfile, TransferResult, planck as _planck, prepare_case
 
 THICK_BAND_TAU = 100.0
 THICK_BAND_REFINEMENT = 4
@@ -104,56 +107,75 @@ def solve_exact(
     ray_steps: int = 192,
     radial_steps: int = 4096,
     frequency_samples: int = 9,
+    workers: int | None = 1,
 ) -> TransferResult:
-    """Вычисляет спектр в заданных точках. T0, Tw в К, R в м, ν = ν* × масштаб."""
+    """Вычисляет спектр в заданных точках. T0, Tw в К, R в м, ν = ν* × масштаб.
+
+    workers — число процессов (точки наблюдения независимы). None — по числу
+    ядер. При workers > 1 вызов должен стоять под `if __name__ == "__main__":`.
+    """
     if min(polar_order, azimuth_order, ray_steps) < 1:
         raise ValueError("Размеры угловых сеток и сетки луча должны быть положительными.")
     radii, nu_star, tau_radial, temperature = prepare_case(
         table, T0, Tw, R, n, frequency_scale_hz, radius_fractions,
         radial_steps, frequency_samples,
     )
-    band_count = len(table.bands)
     frequency_hz = nu_star * frequency_scale_hz
-    shape = (len(radii), band_count, frequency_samples)
-    flux_plus = np.empty(shape)
-    flux_minus = np.empty(shape)
-    div_flux = np.empty(shape)
+    directions = _directions(polar_order, azimuth_order)
+    tasks = [
+        (table, temperature, r, R, frequency_hz, tau_radial, directions, ray_steps)
+        for r in radii
+    ]
+    if workers is None:
+        workers = os.cpu_count() or 1
+    workers = max(1, min(workers, len(tasks)))
+    if workers == 1:
+        parts = [_solve_point(*task) for task in tasks]
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            parts = list(pool.map(_solve_point, *zip(*tasks)))
+    flux_plus, flux_minus, div_flux = (np.stack(values) for values in zip(*parts))
+    return TransferResult(nu_star, tau_radial, radii, flux_plus, flux_minus, div_flux)
 
-    sin_theta, cos_phi, sin_phi, angular_weights = _directions(polar_order, azimuth_order)
+
+def _solve_point(
+    table: OpacityTable, temperature: TemperatureProfile, r: float, R: float,
+    frequency_hz: NDArray, tau_radial: NDArray, directions: tuple[NDArray, ...], ray_steps: int,
+) -> tuple[NDArray, NDArray, NDArray]:
+    """F⁺, F⁻ и div F во всех полосах для одной точки наблюдения r."""
+    sin_theta, cos_phi, sin_phi, angular_weights = directions
     mu_r = sin_theta * cos_phi
     outward_weights = (angular_weights * np.maximum(mu_r, 0))[:, None]
     inward_weights = (angular_weights * np.maximum(-mu_r, 0))[:, None]
+    shape = frequency_hz.shape
+    flux_plus, flux_minus, div_flux = np.empty(shape), np.empty(shape), np.empty(shape)
 
-    for radial_index, r in enumerate(radii):
-        ray_grids = {}
-        local_temperature = temperature(r)
-        for band, frequencies in enumerate(frequency_hz):
-            # В очень плотных полосах дополнительно уточняем отрезки.
-            # Геометрию переиспользуем во всех полосах с той же сеткой.
-            steps = ray_steps
-            if tau_radial[band] >= THICK_BAND_TAU:
-                steps *= THICK_BAND_REFINEMENT
-            if steps not in ray_grids:
-                midpoint_radii, ds = _ray_midpoints(r, R, sin_theta, cos_phi, sin_phi, steps)
-                ray_grids[steps] = temperature(midpoint_radii), ds
-            ray_temperature, ds = ray_grids[steps]
-            local_source = _planck(frequencies, local_temperature)
-            intensity, deficit = _trace_band(
-                frequencies, ray_temperature, table.interpolate(ray_temperature, band),
-                ds, local_source,
-            )
-            # Поток учитывает проекцию на радиус. Оба полупотока записаны
-            # положительными. Чистый радиальный поток равен F+ − F−.
-            flux_plus[radial_index, band] = (intensity * outward_weights).sum(axis=0)
-            flux_minus[radial_index, band] = (intensity * inward_weights).sum(axis=0)
+    ray_grids = {}
+    local_temperature = temperature(r)
+    local_k = table.interpolate_all(np.atleast_1d(local_temperature))[0]
+    for band, frequencies in enumerate(frequency_hz):
+        # В очень плотных полосах дополнительно уточняем отрезки.
+        # Геометрию переиспользуем во всех полосах с той же сеткой.
+        steps = ray_steps
+        if tau_radial[band] >= THICK_BAND_TAU:
+            steps *= THICK_BAND_REFINEMENT
+        if steps not in ray_grids:
+            midpoint_radii, ds = _ray_midpoints(r, R, sin_theta, cos_phi, sin_phi, steps)
+            ray_grids[steps] = temperature(midpoint_radii), ds
+        ray_temperature, ds = ray_grids[steps]
+        local_source = _planck(frequencies, local_temperature)
+        intensity, deficit = _trace_band(
+            frequencies, ray_temperature, table.interpolate(ray_temperature, band),
+            ds, local_source,
+        )
+        # Поток учитывает проекцию на радиус. Оба полупотока записаны
+        # положительными. Чистый радиальный поток равен F+ − F−.
+        flux_plus[band] = (intensity * outward_weights).sum(axis=0)
+        flux_minus[band] = (intensity * inward_weights).sum(axis=0)
 
-            # Интегрируем уравнение переноса по всей сфере направлений.
-            # div Fν = (1/r) d[r(F+ − F−)]/dr = 4πjν − kν∫Iν dΩ.
-            # При jν=kνBν считаем kν∫(Bν−Iν)dΩ. Эта форма не требует
-            # численного дифференцирования потока и применима на оси.
-            local_k = table.interpolate(local_temperature, band)
-            div_flux[radial_index, band] = local_k * (
-                deficit * angular_weights[:, None]
-            ).sum(axis=0)
-
-    return TransferResult(nu_star, tau_radial, radii, flux_plus, flux_minus, div_flux)
+        # Интегрируем уравнение переноса по всей сфере направлений.
+        # div Fν = (1/r) d[r(F+ − F−)]/dr = 4πjν − kν∫Iν dΩ.
+        # При jν=kνBν считаем kν∫(Bν−Iν)dΩ. Эта форма не требует
+        # численного дифференцирования потока и применима на оси.
+        div_flux[band] = local_k[band] * (deficit * angular_weights[:, None]).sum(axis=0)
+    return flux_plus, flux_minus, div_flux
